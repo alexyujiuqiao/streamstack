@@ -1,0 +1,179 @@
+version: '3.8'
+
+services:
+  # Main API service
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - STREAMSTACK_PROVIDER=vllm
+      - STREAMSTACK_VLLM_BASE_URL=http://vllm:8001
+      - STREAMSTACK_REDIS_URL=redis://redis:6379/0
+      - STREAMSTACK_ENABLE_METRICS=true
+      - STREAMSTACK_ENABLE_TRACING=true
+      - STREAMSTACK_JAEGER_ENDPOINT=http://jaeger:14268/api/traces
+      - STREAMSTACK_LOG_LEVEL=INFO
+    depends_on:
+      - redis
+      - prometheus
+      - vllm
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - streamstack
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis for queue management and rate limiting
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - streamstack
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # vLLM server for local LLM inference
+  vllm:
+    image: vllm/vllm-openai:latest
+    ports:
+      - "8001:8000"
+    environment:
+      - VLLM_MODEL=microsoft/DialoGPT-medium
+      - VLLM_HOST=0.0.0.0
+      - VLLM_PORT=8000
+      - VLLM_SERVED_MODEL_NAME=DialoGPT-medium
+    command: >
+      python -m vllm.entrypoints.openai.api_server
+      --model microsoft/DialoGPT-medium
+      --host 0.0.0.0
+      --port 8000
+      --served-model-name DialoGPT-medium
+    volumes:
+      - vllm_cache:/root/.cache/huggingface
+    networks:
+      - streamstack
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 120s
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - streamstack
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    networks:
+      - streamstack
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Jaeger for distributed tracing
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - streamstack
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:14269/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Load testing with Locust
+  locust:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.locust
+    ports:
+      - "8089:8089"
+    environment:
+      - LOCUST_HOST=http://api:8000
+      - LOCUST_USERS=10
+      - LOCUST_SPAWN_RATE=2
+    volumes:
+      - ./tests/load:/mnt/locust
+    networks:
+      - streamstack
+    depends_on:
+      - api
+    profiles:
+      - testing
+
+networks:
+  streamstack:
+    driver: bridge
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  vllm_cache:
