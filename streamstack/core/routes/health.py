@@ -67,8 +67,15 @@ async def health_check() -> HealthResponse:
     
     # Check LLM provider connectivity
     try:
-        # TODO: Implement actual provider health check
-        checks["llm_provider"] = {"status": "healthy", "provider": settings.provider}
+        from streamstack.providers.manager import get_provider_manager
+        provider_manager = get_provider_manager()
+        provider_health = await provider_manager.get_health()
+        checks["llm_provider"] = {
+            "status": "healthy" if provider_health["healthy"] else "unhealthy",
+            "provider": provider_health.get("provider", "unknown"),
+            "latency_ms": provider_health.get("latency_ms"),
+            "error": provider_health.get("error"),
+        }
     except Exception as e:
         logger.warning("LLM provider health check failed", error=str(e))
         checks["llm_provider"] = {"status": "unhealthy", "error": str(e)}
@@ -134,8 +141,12 @@ async def readiness_check() -> ReadinessResponse:
         ready = False
     
     try:
-        # TODO: Quick LLM provider check
-        checks["llm_provider"] = "ready"
+        from streamstack.providers.manager import get_provider_manager
+        provider_manager = get_provider_manager()
+        provider_health = await provider_manager.get_health()
+        checks["llm_provider"] = "ready" if provider_health["healthy"] else "not_ready"
+        if not provider_health["healthy"]:
+            ready = False
     except Exception as e:
         logger.warning("LLM provider readiness check failed", error=str(e))
         checks["llm_provider"] = "not_ready"

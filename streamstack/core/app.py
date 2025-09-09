@@ -37,9 +37,35 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         setup_tracing(settings)
         logger.info("Distributed tracing enabled")
     
-    # TODO: Initialize Redis connection pool
-    # TODO: Initialize LLM providers
-    # TODO: Initialize rate limiters
+    # Initialize provider manager
+    try:
+        from streamstack.providers.manager import get_provider_manager
+        provider_manager = get_provider_manager()
+        await provider_manager.initialize(settings)
+        logger.info("Provider manager initialized")
+    except Exception as e:
+        logger.error("Failed to initialize provider manager", error=str(e))
+        raise
+    
+    # Initialize queue manager
+    try:
+        from streamstack.queue.manager import get_queue_manager
+        queue_manager = get_queue_manager()
+        await queue_manager.initialize(settings)
+        logger.info("Queue manager initialized")
+    except Exception as e:
+        logger.error("Failed to initialize queue manager", error=str(e))
+        raise
+    
+    # Initialize rate limit manager
+    try:
+        from streamstack.queue.rate_limiter import get_rate_limit_manager
+        rate_limit_manager = get_rate_limit_manager()
+        await rate_limit_manager.initialize(settings)
+        logger.info("Rate limit manager initialized")
+    except Exception as e:
+        logger.error("Failed to initialize rate limit manager", error=str(e))
+        raise
     
     logger.info("Application startup complete")
     
@@ -47,8 +73,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     
     logger.info("Shutting down StreamStack application")
     
-    # TODO: Cleanup Redis connections
-    # TODO: Cleanup LLM provider connections
+    # Cleanup provider manager
+    try:
+        from streamstack.providers.manager import get_provider_manager
+        provider_manager = get_provider_manager()
+        await provider_manager.close()
+        logger.info("Provider manager closed")
+    except Exception as e:
+        logger.warning("Error closing provider manager", error=str(e))
+    
+    # Cleanup queue manager
+    try:
+        from streamstack.queue.manager import get_queue_manager
+        queue_manager = get_queue_manager()
+        await queue_manager.close()
+        logger.info("Queue manager closed")
+    except Exception as e:
+        logger.warning("Error closing queue manager", error=str(e))
+    
+    # Cleanup rate limit manager
+    try:
+        from streamstack.queue.rate_limiter import get_rate_limit_manager
+        rate_limit_manager = get_rate_limit_manager()
+        await rate_limit_manager.close()
+        logger.info("Rate limit manager closed")
+    except Exception as e:
+        logger.warning("Error closing rate limit manager", error=str(e))
     
     logger.info("Application shutdown complete")
 

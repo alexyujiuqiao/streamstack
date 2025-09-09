@@ -1,0 +1,20 @@
+# Locust load testing container
+FROM python:3.11-slim
+
+# Install dependencies
+RUN pip install --no-cache-dir locust httpx
+
+# Create non-root user
+RUN groupadd -r locust && useradd -r -g locust locust
+
+# Set working directory
+WORKDIR /mnt/locust
+
+# Switch to non-root user
+USER locust
+
+# Expose port
+EXPOSE 8089
+
+# Default command
+CMD ["locust", "--host", "http://api:8000", "--web-host", "0.0.0.0", "--web-port", "8089"]

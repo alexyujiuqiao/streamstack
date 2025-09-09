@@ -13,74 +13,51 @@ from pydantic import BaseModel, Field
 
 from streamstack.core.config import get_settings
 from streamstack.core.logging import get_logger, get_request_id
+from streamstack.providers.base import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ProviderError,
+    ProviderRateLimitError,
+    ProviderUnavailableError,
+)
+from streamstack.providers.manager import get_provider_manager
 
 router = APIRouter(tags=["chat"])
 logger = get_logger("routes.chat")
 
 
-class ChatMessage(BaseModel):
-    """A single chat message."""
-    role: str = Field(..., description="Message role: system, user, or assistant")
-    content: str = Field(..., description="Message content")
-    name: Optional[str] = Field(None, description="Optional name of the message author")
-
-
-class ChatCompletionRequest(BaseModel):
-    """OpenAI-compatible chat completion request."""
-    model: str = Field(..., description="Model to use for completion")
-    messages: List[ChatMessage] = Field(..., description="List of messages in the conversation")
-    temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0, description="Sampling temperature")
-    max_tokens: Optional[int] = Field(default=None, ge=1, description="Maximum tokens to generate")
-    top_p: Optional[float] = Field(default=1.0, ge=0.0, le=1.0, description="Nucleus sampling parameter")
-    frequency_penalty: Optional[float] = Field(default=0.0, ge=-2.0, le=2.0, description="Frequency penalty")
-    presence_penalty: Optional[float] = Field(default=0.0, ge=-2.0, le=2.0, description="Presence penalty")
-    stop: Optional[Union[str, List[str]]] = Field(default=None, description="Stop sequences")
-    stream: bool = Field(default=False, description="Whether to stream the response")
-    user: Optional[str] = Field(default=None, description="User identifier")
-
-
-class ChatCompletionChoice(BaseModel):
-    """A single completion choice."""
-    index: int = Field(..., description="Choice index")
-    message: ChatMessage = Field(..., description="Generated message")
-    finish_reason: Optional[str] = Field(None, description="Reason for completion finish")
-
-
-class ChatCompletionUsage(BaseModel):
-    """Token usage information."""
-    prompt_tokens: int = Field(..., description="Tokens in the prompt")
-    completion_tokens: int = Field(..., description="Tokens in the completion")
-    total_tokens: int = Field(..., description="Total tokens used")
-
-
-class ChatCompletionResponse(BaseModel):
-    """OpenAI-compatible chat completion response."""
-    id: str = Field(..., description="Completion ID")
-    object: str = Field(default="chat.completion", description="Object type")
-    created: int = Field(..., description="Creation timestamp")
-    model: str = Field(..., description="Model used")
-    choices: List[ChatCompletionChoice] = Field(..., description="Completion choices")
-    usage: ChatCompletionUsage = Field(..., description="Token usage")
-
-
-class ChatCompletionChunk(BaseModel):
-    """Streaming chat completion chunk."""
-    id: str = Field(..., description="Completion ID")
-    object: str = Field(default="chat.completion.chunk", description="Object type")
-    created: int = Field(..., description="Creation timestamp")
-    model: str = Field(..., description="Model used")
-    choices: List[Dict[str, Any]] = Field(..., description="Streaming choices")
-
-
 async def get_rate_limit_info(request: Request) -> Dict[str, Any]:
     """Check rate limiting for the request."""
-    # TODO: Implement actual rate limiting logic
-    return {
-        "allowed": True,
-        "requests_remaining": 95,
-        "tokens_remaining": 9500,
-        "reset_time": int(time.time()) + 60
-    }
+    try:
+        from streamstack.queue.rate_limiter import get_rate_limit_manager
+        
+        # Get client identifier (IP address or user ID)
+        client_ip = request.client.host if request.client else "unknown"
+        user_id = request.headers.get("X-User-ID") or client_ip
+        
+        # Estimate tokens for the request (basic estimation)
+        estimated_tokens = 100  # Default estimate
+        
+        rate_limiter = get_rate_limit_manager().get_rate_limiter()
+        result = await rate_limiter.check_limits(user_id, estimated_tokens)
+        
+        return {
+            "allowed": result.allowed,
+            "requests_remaining": result.remaining,
+            "tokens_remaining": result.remaining * estimated_tokens,
+            "reset_time": result.reset_time,
+            "retry_after": result.retry_after,
+        }
+        
+    except Exception as e:
+        logger.warning("Rate limit check failed, allowing request", error=str(e))
+        # Fail open - allow request if rate limiting is unavailable
+        return {
+            "allowed": True,
+            "requests_remaining": 95,
+            "tokens_remaining": 9500,
+            "reset_time": int(time.time()) + 60,
+        }
 
 
 async def check_idempotency(
@@ -110,14 +87,15 @@ async def create_chat_completion(
     
     # Check rate limits
     if not rate_limit_info["allowed"]:
+        retry_after = rate_limit_info.get("retry_after", 60)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Rate limit exceeded",
             headers={
-                "Retry-After": "60",
-                "X-RateLimit-Limit-Requests": "100",
-                "X-RateLimit-Remaining-Requests": str(rate_limit_info["requests_remaining"]),
-                "X-RateLimit-Reset-Requests": str(rate_limit_info["reset_time"]),
+                "Retry-After": str(retry_after),
+                "X-RateLimit-Limit-Requests": str(rate_limit_info.get("requests_remaining", 0)),
+                "X-RateLimit-Remaining-Requests": str(rate_limit_info.get("requests_remaining", 0)),
+                "X-RateLimit-Reset-Requests": str(rate_limit_info.get("reset_time", 0)),
             }
         )
     
@@ -131,10 +109,21 @@ async def create_chat_completion(
     )
     
     try:
+        # Get provider
+        provider_manager = get_provider_manager()
+        provider = provider_manager.get_provider()
+        
+        # Validate model
+        if not await provider.validate_model(request.model):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Model '{request.model}' is not supported by provider '{provider.name}'"
+            )
+        
         if request.stream:
             # Return streaming response
             return StreamingResponse(
-                stream_chat_completion(request, request_id),
+                stream_chat_completion(provider, request, request_id),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -144,8 +133,25 @@ async def create_chat_completion(
             )
         else:
             # Return complete response
-            return await create_complete_chat_completion(request, request_id)
+            return await provider.chat_completion(request)
             
+    except ProviderRateLimitError as e:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Provider rate limit exceeded",
+            headers={"Retry-After": str(e.retry_after or 60)}
+        )
+    except ProviderUnavailableError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LLM provider unavailable",
+            headers={"Retry-After": str(e.retry_after or 60)}
+        )
+    except ProviderError as e:
+        raise HTTPException(
+            status_code=e.status_code or status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=e.message
+        )
     except Exception as e:
         logger.error("Chat completion failed", error=str(e), error_type=type(e).__name__)
         raise HTTPException(
@@ -155,48 +161,15 @@ async def create_chat_completion(
 
 
 async def stream_chat_completion(
+    provider,
     request: ChatCompletionRequest,
     request_id: str
 ) -> AsyncGenerator[str, None]:
     """Stream chat completion chunks using Server-Sent Events."""
-    completion_id = f"chatcmpl-{request_id}"
-    created = int(time.time())
-    
     try:
-        # TODO: Get actual LLM provider and stream response
-        # For now, simulate streaming
-        content_tokens = ["Hello", " there", "!", " How", " can", " I", " help", " you", " today", "?"]
-        
-        for i, token in enumerate(content_tokens):
-            chunk = ChatCompletionChunk(
-                id=completion_id,
-                created=created,
-                model=request.model,
-                choices=[{
-                    "index": 0,
-                    "delta": {"content": token} if i > 0 else {"role": "assistant", "content": token},
-                    "finish_reason": None
-                }]
-            )
-            
+        async for chunk in provider.chat_completion_stream(request):
             yield f"data: {chunk.model_dump_json()}\n\n"
-            
-            # Simulate processing delay
-            await asyncio.sleep(0.1)
         
-        # Send final chunk
-        final_chunk = ChatCompletionChunk(
-            id=completion_id,
-            created=created,
-            model=request.model,
-            choices=[{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop"
-            }]
-        )
-        
-        yield f"data: {final_chunk.model_dump_json()}\n\n"
         yield "data: [DONE]\n\n"
         
     except Exception as e:
@@ -209,41 +182,3 @@ async def stream_chat_completion(
             }
         }
         yield f"data: {json.dumps(error_chunk)}\n\n"
-
-
-async def create_complete_chat_completion(
-    request: ChatCompletionRequest,
-    request_id: str
-) -> ChatCompletionResponse:
-    """Create a complete (non-streaming) chat completion."""
-    completion_id = f"chatcmpl-{request_id}"
-    created = int(time.time())
-    
-    # TODO: Get actual LLM provider and generate response
-    # For now, return a mock response
-    
-    response_message = ChatMessage(
-        role="assistant",
-        content="Hello there! How can I help you today?"
-    )
-    
-    choice = ChatCompletionChoice(
-        index=0,
-        message=response_message,
-        finish_reason="stop"
-    )
-    
-    usage = ChatCompletionUsage(
-        prompt_tokens=len(" ".join(msg.content for msg in request.messages)) // 4,  # Rough estimate
-        completion_tokens=len(response_message.content) // 4,  # Rough estimate
-        total_tokens=0
-    )
-    usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
-    
-    return ChatCompletionResponse(
-        id=completion_id,
-        created=created,
-        model=request.model,
-        choices=[choice],
-        usage=usage
-    )
