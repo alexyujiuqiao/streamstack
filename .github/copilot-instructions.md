@@ -292,36 +292,71 @@ streamstack/
 
 ## Timing Expectations
 
-- **Dependency Installation**: 3-10 minutes
-- **Test Suite**: 5-15 minutes  
-- **Load Tests**: 10-30 minutes
-- **Docker Compose Startup**: 2-5 minutes
+**Validated timings from current environment:**
+- **Virtual Environment Creation**: ~3 seconds
+- **Pip Package Upgrades**: ~4 seconds (with internet)
+- **Repository Git Operations**: <1 second
+
+**Expected timings when code is present:**
+- **Dependency Installation**: 3-10 minutes (varies by network and package cache)
+- **Test Suite**: 5-15 minutes (depends on test coverage and complexity)
+- **Load Tests**: 10-30 minutes (configurable duration)
+- **Docker Compose Startup**: 2-5 minutes (initial download may take longer)
 - **API Response Time**: < 100ms for health checks, 1-30s for LLM requests
 
 ## Common Issues and Solutions
 
-### Redis Connection Errors
+### Repository State Issues
+```bash
+# If commands fail because no code is present
+git branch -r  # Check available branches
+git log --oneline -10  # Check recent commits
+
+# Look for development branches with actual code
+git checkout <branch-with-code>  # If available
+```
+
+### Python Environment Issues
+```bash
+# If virtual environment issues occur
+rm -rf venv  # Remove corrupted environment
+python3 -m venv venv  # Recreate
+source venv/bin/activate  # Reactivate
+pip install --upgrade pip setuptools wheel  # Reinstall basics
+```
+
+### Redis Connection Errors (when code is present)
 ```bash
 # Start Redis if not running
 redis-server --daemonize yes
 
 # Check Redis status
-redis-cli ping
+redis-cli ping  # Should return "PONG"
+
+# If Redis not installed
+apt-get update && apt-get install -y redis-server
 ```
 
-### Missing Dependencies
+### Missing Dependencies (when code is present)
 ```bash
 # Reinstall dependencies
-pip install -e ".[dev]" --force-reinstall
+pip install -e ".[dev]" --force-reinstall --timeout 600
+
+# Check for specific missing packages
+pip list | grep fastapi
+pip list | grep redis
 ```
 
 ### API Key Issues
 ```bash
-# Verify API key is set
+# Verify API key is set and valid
 echo $OPENAI_API_KEY
 
-# Test API key validity
+# Test API key validity (when internet available)
 curl -H "Authorization: Bearer $OPENAI_API_KEY" https://api.openai.com/v1/models
+
+# Set API key if missing
+export OPENAI_API_KEY="your_api_key_here"
 ```
 
 ### Docker Issues
@@ -331,13 +366,35 @@ docker-compose down && docker-compose up -d
 
 # Check service logs
 docker-compose logs -f api
+
+# Verify Docker daemon is running
+docker info
 ```
 
-### Performance Issues
+### Port Conflicts
+```bash
+# Check if port 8000 is in use
+lsof -i :8000
+
+# Kill process using the port
+kill -9 $(lsof -t -i:8000)
+
+# Use alternative port
+uvicorn streamstack.main:app --port 8080
+```
+
+### Performance Issues (when application is running)
 - Monitor metrics at `/metrics` endpoint
-- Check queue depth and response times
-- Verify Redis performance with `redis-cli info stats`
-- Use load testing to identify bottlenecks
+- Check queue depth and response times in metrics
+- Verify Redis performance: `redis-cli info stats`
+- Use load testing to identify bottlenecks: `locust -f tests/load/locustfile.py`
+- Check system resources: `htop` or `top`
+
+### Build/Installation Timeouts
+- **NEVER CANCEL** long-running operations
+- Use `--timeout 600` or higher for pip installs
+- Check internet connectivity if downloads fail
+- Clear pip cache if installation corrupted: `pip cache purge`
 
 ## CI/CD Integration
 
@@ -351,12 +408,101 @@ The repository includes GitHub Actions workflows (when implemented):
 
 ## Development Best Practices
 
-1. **Always activate the virtual environment** before working: `source venv/bin/activate`
-2. **Test locally first** using the validation scenarios above
-3. **Monitor application logs** for errors and performance issues  
-4. **Use structured logging** with correlation IDs for debugging
-5. **Implement proper error handling** with appropriate HTTP status codes
-6. **Add metrics** for new features using the existing Prometheus setup
-7. **Update this documentation** when adding new features or changing workflows
+1. **Check repository state first**:
+   ```bash
+   # See what branches are available
+   git branch -r
+   
+   # Check for actual application code
+   ls -la  # Current main has only README.md and LICENSE
+   ```
+
+2. **Always activate the virtual environment** before working:
+   ```bash
+   source venv/bin/activate
+   ```
+
+3. **Use proper branch workflow**:
+   ```bash
+   # Check available development branches
+   git fetch --all
+   git branch -r
+   
+   # If working with existing development code from PRs
+   git checkout -b local-branch origin/development-branch-name
+   
+   # Create new feature branch from main
+   git checkout main
+   git pull origin main  
+   git checkout -b feature/your-feature
+   ```
+
+4. **Test locally first** using the validation scenarios above
+
+5. **Monitor application logs** for errors and performance issues:
+   ```bash
+   # Watch application logs
+   tail -f logs/streamstack.log  # When logging is configured
+   
+   # Docker logs
+   docker-compose logs -f api
+   ```
+
+6. **Use structured logging** with correlation IDs for debugging
+
+7. **Implement proper error handling** with appropriate HTTP status codes
+
+8. **Add metrics** for new features using the existing Prometheus setup:
+   ```python
+   from streamstack.observability.metrics import record_token_usage
+   record_token_usage(provider="openai", model="gpt-3.5-turbo", prompt_tokens=100, completion_tokens=50)
+   ```
+
+9. **Update this documentation** when adding new features or changing workflows
+
+10. **Follow the timeout guidelines**:
+    - Set 60+ minute timeouts for builds  
+    - Set 30+ minute timeouts for test suites
+    - **NEVER CANCEL** long-running operations
 
 Remember: This is a production system handling LLM requests. Always prioritize reliability, performance, and proper error handling in your changes.
+
+## Final Validation Checklist
+
+Before considering any implementation complete, verify ALL of the following:
+
+### Environment Setup ✓ (Currently Working)
+- [ ] Python 3.9+ available: `python3 --version`
+- [ ] Virtual environment creation: `python3 -m venv test && rm -rf test`
+- [ ] Git operations: `git status && git remote -v`
+- [ ] Docker availability: `docker --version`
+
+### Code Implementation (When Present)
+- [ ] Dependencies install without errors: `pip install -e ".[dev]"` 
+- [ ] Application starts: `uvicorn streamstack.main:app --host 0.0.0.0 --port 8000`
+- [ ] Health checks respond: `curl http://localhost:8000/health`
+- [ ] Metrics endpoint works: `curl http://localhost:8000/metrics`
+
+### Full Integration Test (When Complete)
+- [ ] Chat completions work: Send test request to `/v1/chat/completions`
+- [ ] Streaming responses work: Test with `"stream": true`
+- [ ] Rate limiting functions: Test exceeding request limits
+- [ ] Redis operations succeed: Verify queue and rate limit storage
+- [ ] Load testing passes: Run Locust tests for 5+ minutes
+- [ ] Docker Compose deployment works: All services start and communicate
+
+### Code Quality
+- [ ] All tests pass: `pytest` 
+- [ ] Code formatting: `black streamstack tests`
+- [ ] Import sorting: `isort streamstack tests`
+- [ ] Linting passes: `flake8 streamstack tests`
+- [ ] Type checking: `mypy streamstack`
+
+### Performance Validation
+- [ ] Health check response time < 100ms
+- [ ] Chat completion response time < 30s under normal load
+- [ ] System handles concurrent requests without errors
+- [ ] Memory usage remains stable under load
+- [ ] No connection leaks or resource exhaustion
+
+**Only mark the copilot instructions as complete when ALL items above are validated and working.**
